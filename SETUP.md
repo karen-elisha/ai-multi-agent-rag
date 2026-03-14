@@ -29,7 +29,7 @@ python --version
 # 2. Clone the Repository
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/ai-multi-agent-rag.git
+git clone https://github.com/karen-elisha/ai-multi-agent-rag.git
 cd ai-multi-agent-rag
 ```
 
