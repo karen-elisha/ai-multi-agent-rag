@@ -1,5 +1,6 @@
 import os
 import io
+import json
 import pandas as pd
 from pypdf import PdfReader
 from docx import Document
@@ -20,12 +21,28 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 FOLDER_ID = os.getenv("FOLDER_ID")
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+UPLOADED_FILES_RECORD = "uploaded_files.json"  # Local tracker file
 
 # Connect
 pc = Pinecone(api_key=PINECONE_API_KEY)
 groq_client = Groq(api_key=GROQ_API_KEY)
 index = pc.Index("employee-rag")
 model = SentenceTransformer("all-MiniLM-L6-v2")
+
+# ─────────────────────────────────────────
+# UPLOAD TRACKER
+# ─────────────────────────────────────────
+def load_uploaded_record():
+    """Load the set of already-uploaded file IDs from local JSON."""
+    if os.path.exists(UPLOADED_FILES_RECORD):
+        with open(UPLOADED_FILES_RECORD, "r") as f:
+            return set(json.load(f))
+    return set()
+
+def save_uploaded_record(uploaded_ids: set):
+    """Persist the updated set of uploaded file IDs."""
+    with open(UPLOADED_FILES_RECORD, "w") as f:
+        json.dump(list(uploaded_ids), f)
 
 # ─────────────────────────────────────────
 # GOOGLE DRIVE
@@ -38,7 +55,7 @@ def get_drive_service():
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
+            flow = InstalledAppFlow.from_client_secrets_file("../credentials.json", SCOPES)
             creds = flow.run_local_server(port=0)
         with open("token.json", "w") as token:
             token.write(creds.to_json())
@@ -74,48 +91,76 @@ def extract_text(buf, filename):
                 texts.append(para.text)
     return texts
 
-def load_files_from_drive():
+def sync_new_files_from_drive():
+    """
+    Checks Google Drive for files not yet uploaded to Pinecone.
+    Returns extracted text chunks only from new files.
+    """
     print("🔗 Connecting to Google Drive...")
     service = get_drive_service()
+
     results = service.files().list(
         q=f"'{FOLDER_ID}' in parents",
         fields="files(id, name, mimeType)"
     ).execute()
-    files = results.get("files", [])
-    print(f"📁 Found {len(files)} files in Drive folder")
+    all_drive_files = results.get("files", [])
+    print(f"📁 Found {len(all_drive_files)} total files in Drive folder")
+
+    uploaded_ids = load_uploaded_record()
+    new_files = [f for f in all_drive_files if f["id"] not in uploaded_ids]
+
+    if not new_files:
+        print("✅ No new files to upload. Pinecone is already up to date.")
+        return [], uploaded_ids
+
+    print(f"🆕 {len(new_files)} new file(s) detected — processing...")
     all_texts = []
-    for file in files:
+    newly_uploaded_ids = set()
+
+    for file in new_files:
         filename = file["name"]
         file_id = file["id"]
         print(f"  Reading {filename}...")
         try:
             buf = download_file(service, file_id, filename)
             texts = extract_text(buf, filename)
-            all_texts.extend(texts)
-            print(f"  ✅ Extracted {len(texts)} chunks from {filename}")
+            if texts:
+                all_texts.extend(texts)
+                newly_uploaded_ids.add(file_id)
+                print(f"  ✅ Extracted {len(texts)} chunks from {filename}")
+            else:
+                print(f"  ⚠️  No text extracted from {filename} — skipping")
         except Exception as e:
             print(f"  ❌ Could not read {filename}: {e}")
-    print(f"\n✅ Total chunks extracted: {len(all_texts)}")
-    return all_texts
+
+    updated_ids = uploaded_ids | newly_uploaded_ids
+    return all_texts, updated_ids
 
 # ─────────────────────────────────────────
 # PINECONE
 # ─────────────────────────────────────────
-def store_in_pinecone(texts):
+def store_in_pinecone(texts, updated_ids):
     print("\n📤 Uploading to Pinecone...")
     texts = [t for t in texts if len(t.strip()) >= 10]
+
+    # Use current index stats to offset new chunk IDs and avoid overwriting old ones
+    stats = index.describe_index_stats()
+    existing_count = stats.get("total_vector_count", 0)
+
     batch_size = 100
     for i in range(0, len(texts), batch_size):
-        batch_texts = texts[i:i+batch_size]
+        batch_texts = texts[i:i + batch_size]
         embeddings = model.encode(batch_texts).tolist()
         vectors = [{
-            "id": f"chunk_{i+j}",
+            "id": f"chunk_{existing_count + i + j}",
             "values": embeddings[j],
             "metadata": {"text": batch_texts[j]}
         } for j in range(len(batch_texts))]
         index.upsert(vectors=vectors)
-        print(f"  Uploaded {min(i+batch_size, len(texts))}/{len(texts)} chunks...")
-    print("✅ All data stored in Pinecone!")
+        print(f"  Uploaded {min(i + batch_size, len(texts))}/{len(texts)} chunks...")
+
+    save_uploaded_record(updated_ids)  # Persist only after successful upload
+    print("✅ All new data stored in Pinecone!")
 
 # ─────────────────────────────────────────
 # ASK QUESTIONS
@@ -138,19 +183,19 @@ Answer this: {question}"""
 
     response = groq_client.chat.completions.create(
         model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "user", "content": prompt}
-        ]
+        messages=[{"role": "user", "content": prompt}]
     )
     return response.choices[0].message.content
 
 # ─────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────
+new_texts, updated_ids = sync_new_files_from_drive()
 
-# Uncomment ONLY when you have new files to upload
-# texts = load_files_from_drive()
-# store_in_pinecone(texts)
+if new_texts:
+    store_in_pinecone(new_texts, updated_ids)
+else:
+    print("⏭️  Skipping Pinecone upload — nothing new to store.")
 
 print("\n🤖 Assistant ready! Ask anything about your data (type 'quit' to exit)\n")
 while True:
