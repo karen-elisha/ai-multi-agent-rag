@@ -19,3 +19,8 @@ processed_files.json
 
 # OS files
 .DS_Store
+
+# Frontend
+node_modules/
+dist/
+build/
